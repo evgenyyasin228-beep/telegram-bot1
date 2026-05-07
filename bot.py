@@ -39,6 +39,16 @@ menu_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=False,
 )
 
+# Клавиатура ТОЛЬКО с кнопкой отмены (для этапа ожидания хэша)
+cancel_only_keyboard = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("❌ Отменить платёж")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+
 async def get_usd_rate() -> Decimal:
     """Получает текущий курс доллара ЦБ РФ"""
     try:
@@ -48,6 +58,7 @@ async def get_usd_rate() -> Decimal:
             return Decimal(str(data["Valute"]["USD"]["Value"]))
     except Exception:
         return Decimal("85.0")
+
 
 async def verify_trc20_payment(tx_hash: str, expected_amount: Decimal) -> tuple:
     """Точная проверка транзакции USDT TRC20"""
@@ -93,9 +104,9 @@ async def verify_trc20_payment(tx_hash: str, expected_amount: Decimal) -> tuple:
             
             # Извлечение адреса получателя
             to_address_hex = raw_data[8:72]
-            to_address = "41" + to_address_hex[24:]  # Конвертация в hex-адрес Tron
+            to_address = "41" + to_address_hex[24:]
             
-            # Проверка адреса получателя (сравниваем в HEX)
+            # Проверка адреса получателя
             expected_hex = _base58_to_hex(YOUR_TRC20_ADDRESS)
             if to_address.lower() != expected_hex.lower():
                 return False, "❌ Получатель не совпадает."
@@ -116,6 +127,7 @@ async def verify_trc20_payment(tx_hash: str, expected_amount: Decimal) -> tuple:
     finally:
         processing_hashes.discard(tx_hash)
 
+
 def _base58_to_hex(address: str) -> str:
     """Конвертирует Base58 адрес в HEX"""
     try:
@@ -125,13 +137,17 @@ def _base58_to_hex(address: str) -> str:
     except:
         return ""
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Стартовое сообщение с главным меню"""
     await update.message.reply_text(
         "👋 Добро пожаловать! Выберите интересующий вас вопрос:",
         reply_markup=menu_keyboard,
     )
 
+
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик главного меню"""
     user = update.effective_user
     text = update.message.text
 
@@ -150,6 +166,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⭐ Выберите тариф Telegram Premium:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+    elif text == "❌ Отменить платёж":
+        # Нажата кнопка отмены на этапе хэша
+        await cancel_payment(update, context)
     else:
         await context.bot.send_message(
             chat_id=YOUR_USER_ID,
@@ -160,7 +179,21 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=menu_keyboard,
         )
 
+
+async def cancel_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена платежа и возврат в главное меню"""
+    user_id = update.effective_user.id
+    if user_id in pending_transactions:
+        del pending_transactions[user_id]
+    
+    await update.message.reply_text(
+        "❌ Платёж отменён. Вы вернулись в главное меню.",
+        reply_markup=menu_keyboard,
+    )
+
+
 async def premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает цену, адрес TRC20 и запрашивает хэш"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -180,29 +213,80 @@ async def premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "usdt_amount": usdt_amount,
     }
 
+    # Inline-кнопка отмены под сообщением с адресом
+    cancel_inline = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить заказ", callback_data="cancel_order")]
+    ])
+
     await query.edit_message_text(
         f"💳 <b>Telegram Premium — {tariff_name}</b>\n\n"
         f"💰 Цена: <b>{rub_price} ₽</b>\n"
         f"💵 Курс ЦБ: <b>{usd_rate:.2f} ₽/$</b>\n"
         f"🪙 Сумма к оплате: <b>{usdt_amount} USDT</b>\n\n"
         f"📤 Адрес TRC20:\n<code>{YOUR_TRC20_ADDRESS}</code>\n\n"
-        f"⚠️ Отправьте точную сумму и пришлите хэш транзакции",
+        f"⚠️ Отправьте хэш транзакции после оплаты\n"
+        f"Или нажмите кнопку ниже для отмены 👇",
         parse_mode="HTML",
+        reply_markup=cancel_inline,
     )
+    
+    # Показываем клавиатуру с кнопкой отмены платежа
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="⏳ Ожидаю хэш транзакции...",
+        reply_markup=cancel_only_keyboard,
+    )
+    
     return WAITING_HASH
 
+
+async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена заказа через inline-кнопку под сообщением с адресом"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id in pending_transactions:
+        del pending_transactions[user_id]
+    
+    await query.edit_message_text(
+        "❌ Заказ отменён.",
+        reply_markup=None,
+    )
+    
+    # Отправляем главное меню
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="Вы вернулись в главное меню:",
+        reply_markup=menu_keyboard,
+    )
+    
+    return ConversationHandler.END
+
+
 async def receive_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает хэш и проверяет транзакцию"""
     user = update.effective_user
-    tx_hash = update.message.text.strip()
+    text = update.message.text.strip()
+    
+    # Проверка на кнопку отмены платежа
+    if text == "❌ Отменить платёж":
+        await cancel_payment(update, context)
+        return ConversationHandler.END
     
     if user.id not in pending_transactions:
-        await update.message.reply_text("❌ Нет активного заказа.")
+        await update.message.reply_text(
+            "❌ Нет активного заказа.",
+            reply_markup=menu_keyboard,
+        )
         return ConversationHandler.END
 
     order = pending_transactions[user.id]
-    status_msg = await update.message.reply_text("⏳ Проверяю транзакцию в Tron...")
+    status_msg = await update.message.reply_text(
+        "⏳ Проверяю транзакцию в Tron...",
+    )
 
-    success, message = await verify_trc20_payment(tx_hash, order["usdt_amount"])
+    success, message = await verify_trc20_payment(text, order["usdt_amount"])
 
     if success:
         order_id = f"ORD{int(datetime.now().timestamp())}"
@@ -210,7 +294,7 @@ async def receive_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "customer_id": user.id,
             "tariff": order["tariff"],
             "usdt_amount": order["usdt_amount"],
-            "hash": tx_hash,
+            "hash": text,
             "username": None,
         }
 
@@ -221,31 +305,55 @@ async def receive_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  f"⭐ Тариф: {order['tariff']}\n"
                  f"🪙 Сумма: {order['usdt_amount']} USDT\n"
                  f"👤 Покупатель: @{user.username or 'нет'} (ID: {user.id})\n"
-                 f"🔗 Хэш: <code>{tx_hash}</code>\n\n"
+                 f"🔗 Хэш: <code>{text}</code>\n\n"
                  f"Ожидаю username для подарка.",
             parse_mode="HTML",
         )
 
         await status_msg.edit_text(
-            f"{message}\n\nВведите @username получателя Premium:"
+            f"{message}\n\nВведите @username получателя Premium:",
         )
+        
+        # Возвращаем главное меню (без кнопки отмены)
+        await update.message.reply_text(
+            "Введите username:",
+            reply_markup=menu_keyboard,
+        )
+        
         context.user_data["current_order_id"] = order_id
         return WAITING_USERNAME
     else:
         await status_msg.edit_text(
-            f"{message}\n\nПроверьте хэш и отправьте снова."
+            f"{message}\n\nПроверьте хэш и отправьте снова.",
+        )
+        # Оставляем кнопку отмены платежа
+        await update.message.reply_text(
+            "Отправьте хэш ещё раз:",
+            reply_markup=cancel_only_keyboard,
         )
         return WAITING_HASH
 
+
 async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает username для подарка"""
     user = update.effective_user
-    username = update.message.text.strip()
+    text = update.message.text.strip()
+    
+    # Проверка на кнопку отмены (на всякий случай)
+    if text == "❌ Отменить платёж":
+        await cancel_payment(update, context)
+        return ConversationHandler.END
+    
     order_id = context.user_data.get("current_order_id")
 
     if not order_id or order_id not in completed_orders:
-        await update.message.reply_text("❌ Заказ не найден.")
+        await update.message.reply_text(
+            "❌ Заказ не найден.",
+            reply_markup=menu_keyboard,
+        )
         return ConversationHandler.END
 
+    username = text
     completed_orders[order_id]["username"] = username
 
     keyboard = InlineKeyboardMarkup([
@@ -271,7 +379,9 @@ async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del context.user_data["current_order_id"]
     return ConversationHandler.END
 
+
 async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает 'Заказ выполнен' от вас"""
     query = update.callback_query
     await query.answer()
 
@@ -300,7 +410,9 @@ async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
+
 async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответ владельца пользователю"""
     if update.effective_user.id != YOUR_USER_ID:
         return
 
@@ -320,12 +432,6 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=user_id, text=f"📩 Ответ:\n\n{update.message.text}")
     await update.message.reply_text("✅ Ответ отправлен!")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in pending_transactions:
-        del pending_transactions[user_id]
-    await update.message.reply_text("❌ Операция отменена.", reply_markup=menu_keyboard)
-    return ConversationHandler.END
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -333,10 +439,17 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(premium_callback, pattern="^premium_")],
         states={
-            WAITING_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_hash)],
-            WAITING_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_username)],
+            WAITING_HASH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_hash),
+                CallbackQueryHandler(cancel_order_callback, pattern="^cancel_order$"),
+            ],
+            WAITING_USERNAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_username),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            MessageHandler(filters.Regex("^❌ Отменить платёж$"), cancel_payment),
+        ],
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -345,8 +458,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, handle_menu))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, reply_to_user))
 
-    print("Бот с проверкой USDT TRC20 запущен...")
+    print("Бот запущен...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
